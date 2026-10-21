@@ -3,14 +3,20 @@ name: build-wordpress-patched
 on:
   workflow_dispatch:
     inputs:
-      platforms:
-        description: "Server arch: x86_64 = linux/amd64, aarch64 = linux/arm64"
-        default: linux/amd64
+      arch:
+        description: "Server arch: x86_64 = amd64, aarch64 = arm64"
+        type: choice
+        options: [amd64, arm64]
+        default: amd64
 
 env:
   PHP_VERSION: "8.3.36"
+  # Docker Hub's php:8.3.36-* tags are empty indexes (no platform images) as of 2026-10-21,
+  # so build the base ourselves from docker-library/php master after "[security] Update to ... 8.3.36 ...".
+  # Its PHP_SHA256 matches the php-8.3.36.tar.xz checksum published on php.net.
+  PHP_REPO_SHA: e3eaff845f7a9f7259c31da54dce0320b47a3bbd
   # docker-library/wordpress master as of 2026-10-21; latest/php8.3/apache unchanged since "Update latest to 7.1.3"
-  UPSTREAM_SHA: 2d7faab7fb71508e6854cdbed948c195957f279e
+  WP_REPO_SHA: 2d7faab7fb71508e6854cdbed948c195957f279e
 
 permissions:
   contents: read
@@ -18,28 +24,48 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v7
         with:
+          repository: docker-library/php
+          ref: ${{ env.PHP_REPO_SHA }}
+          path: php
+
+      - uses: actions/checkout@v7
+        with:
           repository: docker-library/wordpress
-          ref: ${{ env.UPSTREAM_SHA }}
-          path: upstream
+          ref: ${{ env.WP_REPO_SHA }}
+          path: wordpress
 
-      - name: Pin PHP base image
-        working-directory: upstream/latest/php8.3/apache
+      - name: Check the PHP source pin
+        working-directory: php/8.3/trixie/apache
         run: |
-          sed -i "s|^FROM php:8.3-apache\$|FROM php:${PHP_VERSION}-apache|" Dockerfile
-          grep -qx "FROM php:${PHP_VERSION}-apache" Dockerfile
-          grep -n '^FROM' Dockerfile
+          grep -n 'ENV PHP_VERSION' Dockerfile
+          grep -qx "ENV PHP_VERSION ${PHP_VERSION}" Dockerfile
 
-      - name: Set image name
+      - name: Build PHP base image
+        run: |
+          docker build -t "php-base:${PHP_VERSION}-apache" php/8.3/trixie/apache
+          docker run --rm "php-base:${PHP_VERSION}-apache" php -v | tee /dev/stderr | grep -q "PHP ${PHP_VERSION} "
+
+      - name: Build WordPress image on it
+        working-directory: wordpress/latest/php8.3/apache
         run: |
           owner=$(echo "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
           echo "IMAGE=ghcr.io/${owner}/wordpress-patched:${PHP_VERSION}" >> "$GITHUB_ENV"
+          sed -i "s|^FROM php:8.3-apache\$|FROM php-base:${PHP_VERSION}-apache|" Dockerfile
+          grep -qx "FROM php-base:${PHP_VERSION}-apache" Dockerfile
+          docker build -t "ghcr.io/${owner}/wordpress-patched:${PHP_VERSION}" .
 
-      - uses: docker/setup-qemu-action@v4
-      - uses: docker/setup-buildx-action@v4
+      - name: Verify the image
+        run: |
+          docker run --rm "$IMAGE" php -v | tee /dev/stderr | grep -q "PHP ${PHP_VERSION} "
+          mods=$(docker run --rm "$IMAGE" php -m)
+          for e in bcmath exif gd imagick intl mysqli zip "Zend OPcache"; do
+            echo "$mods" | grep -qix "$e" || { echo "missing PHP module: $e"; exit 1; }
+          done
+          docker run --rm "$IMAGE" apache2ctl -t 2>&1 | tee /dev/stderr | grep -q "Syntax OK"
 
       - uses: docker/login-action@v4
         with:
@@ -47,17 +73,5 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: docker/build-push-action@v7
-        with:
-          context: upstream/latest/php8.3/apache
-          platforms: ${{ inputs.platforms }}
-          pull: true
-          provenance: false
-          push: true
-          tags: ${{ env.IMAGE }}
-
-      - name: Verify PHP version in the pushed image
-        env:
-          PLATFORMS: ${{ inputs.platforms }}
-        run: |
-          docker run --rm --platform "${PLATFORMS%%,*}" "$IMAGE" php -v | tee /dev/stderr | grep -q "PHP ${PHP_VERSION}"
+      - name: Push
+        run: docker push "$IMAGE"
