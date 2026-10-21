@@ -1,0 +1,137 @@
+name: sync-bookstack-patched
+
+# Keeps ghcr.io/<owner>/bookstack-patched:latest never older than LinuxServer's bookstack:latest,
+# and on the newest PHP 8.5.x whenever Alpine has published it:
+#   - upstream already has the newest PHP -> mirror it (identical image, multi-arch)
+#   - upstream is behind                  -> upstream + `apk upgrade`; pushed even if Alpine has not caught up yet
+#                                            (never behind upstream), with a warning while PHP is still behind
+#   - that build fails verification       -> mirror upstream instead, so a broken build can never leave you behind
+# Once LinuxServer has rebuilt, this is a plain mirror and nothing needs switching back.
+
+on:
+  schedule:
+    - cron: "41 */6 * * *"
+  workflow_dispatch:
+
+env:
+  BRANCH: "8.5"
+  UPSTREAM: ghcr.io/linuxserver/bookstack:latest
+
+permissions:
+  contents: read
+  packages: write
+  actions: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      # GitHub disables scheduled workflows after 60 days without repo activity; re-enabling resets that timer
+      - name: Keep scheduled runs alive
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/bookstack.yml/enable"
+
+      - uses: actions/checkout@v7
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Decide what to do
+        id: plan
+        run: |
+          owner=$(echo "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
+          rolling="ghcr.io/${owner}/bookstack-patched:latest"
+          required=$(curl -fsS "https://www.php.net/releases/?json&version=${BRANCH}" | jq -r .version)
+
+          docker pull -q "$UPSTREAM" > /dev/null
+          upstream_php=$(docker run --rm --entrypoint /usr/bin/php85 "$UPSTREAM" -v | awk 'NR==1{print $2}')
+          upstream_digest=$(docker buildx imagetools inspect --raw "$UPSTREAM" | sha256sum | cut -d' ' -f1)
+
+          ours_php=0
+          ours_base=none
+          if docker pull -q "$rolling" > /dev/null 2>&1; then
+            ours_php=$(docker run --rm --entrypoint /usr/bin/php85 "$rolling" -v | awk 'NR==1{print $2}')
+            ours_base=$(docker inspect --format '{{ index .Config.Labels "patched.base-digest" }}' "$rolling")
+          fi
+          echo "required=$required upstream=$upstream_php ours=$ours_php"
+
+          ge() { [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -n1)" = "$2" ]; }
+          if ge "$upstream_php" "$required"; then
+            mode=mirror
+            ours_digest=$(docker buildx imagetools inspect --raw "$rolling" 2>/dev/null | sha256sum | cut -d' ' -f1)
+            [ "$upstream_digest" = "$ours_digest" ] && mode=none
+          elif ge "$ours_php" "$required" && [ "$ours_base" = "$upstream_digest" ]; then
+            mode=none
+          else
+            mode=build
+          fi
+          echo "mode=$mode"
+
+          {
+            echo "mode=$mode"
+            echo "rolling=$rolling"
+            echo "required=$required"
+            echo "upstream_php=$upstream_php"
+            echo "upstream_digest=$upstream_digest"
+            echo "ours_php=$ours_php"
+            echo "ours_base=$ours_base"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Mirror the upstream image
+        if: steps.plan.outputs.mode == 'mirror'
+        run: docker buildx imagetools create -t "${{ steps.plan.outputs.rolling }}" "$UPSTREAM"
+
+      # continue-on-error: a failed build or check falls through to the mirror below instead of leaving the tag stale
+      - name: Build and verify upstream + apk upgrade
+        id: candidate
+        if: steps.plan.outputs.mode == 'build'
+        continue-on-error: true
+        env:
+          ROLLING: ${{ steps.plan.outputs.rolling }}
+          UPSTREAM_DIGEST: ${{ steps.plan.outputs.upstream_digest }}
+          UPSTREAM_PHP: ${{ steps.plan.outputs.upstream_php }}
+          OURS_PHP: ${{ steps.plan.outputs.ours_php }}
+          OURS_BASE: ${{ steps.plan.outputs.ours_base }}
+        run: |
+          ge() { [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -n1)" = "$2" ]; }
+          base="${UPSTREAM%%:*}@sha256:${UPSTREAM_DIGEST}"
+          docker build --build-arg "BASE=${base}" --label "patched.base-digest=${UPSTREAM_DIGEST}" -t "$ROLLING" bookstack
+
+          php=$(docker run --rm --entrypoint /usr/bin/php85 "$ROLLING" -v | tee /dev/stderr | awk 'NR==1{print $2}')
+          fpm=$(docker run --rm --entrypoint /usr/sbin/php-fpm85 "$ROLLING" -v | tee /dev/stderr | awk 'NR==1{print $2}')
+          [ "$php" = "$fpm" ]
+          ge "$php" "$UPSTREAM_PHP"
+          mods=$(docker run --rm --entrypoint /usr/bin/php85 "$ROLLING" -m)
+          for e in curl dom exif gd ldap mbstring memcached mysqlnd pdo_mysql tokenizer xml zip; do
+            echo "$mods" | grep -qix "$e" || { echo "missing PHP module: $e"; exit 1; }
+          done
+          docker run --rm --entrypoint test "$ROLLING" -f /app/www/artisan
+
+          # skip the push when nothing changed since the last build, so the tag does not churn
+          push=true
+          [ "$OURS_BASE" = "$UPSTREAM_DIGEST" ] && [ "$php" = "$OURS_PHP" ] && push=false
+          echo "php=$php" >> "$GITHUB_OUTPUT"
+          echo "push=$push" >> "$GITHUB_OUTPUT"
+
+      - name: Push the build
+        if: steps.candidate.outcome == 'success' && steps.candidate.outputs.push == 'true'
+        run: docker push "${{ steps.plan.outputs.rolling }}"
+
+      - name: Warn if PHP is still behind
+        if: steps.candidate.outcome == 'success'
+        env:
+          REQUIRED: ${{ steps.plan.outputs.required }}
+          PHP: ${{ steps.candidate.outputs.php }}
+        run: |
+          ge() { [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -n1)" = "$2" ]; }
+          ge "$PHP" "$REQUIRED" || echo "::warning::PHP ${PHP} is behind ${REQUIRED}: Alpine has not published the fix for this branch yet"
+
+      - name: Fallback - mirror upstream
+        if: steps.plan.outputs.mode == 'build' && steps.candidate.outcome != 'success'
+        run: |
+          echo "::warning::build or verification failed; mirroring upstream so the tag is not left behind"
+          docker buildx imagetools create -t "${{ steps.plan.outputs.rolling }}" "$UPSTREAM"
